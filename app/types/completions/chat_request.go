@@ -1,6 +1,7 @@
 package completions
 
 import (
+	"fmt"
 	"strings"
 
 	"chat2api/app/types/chat"
@@ -9,19 +10,7 @@ import (
 )
 
 func BuildChatRequest(apiReq *ApiReq) *chat.Request {
-	messages := make([]chat.Message, 0, len(apiReq.Messages))
-	for _, apiMessage := range apiReq.Messages {
-		messages = append(messages, chat.Message{
-			Id: uuid.New().String(),
-			Author: chat.Author{
-				Role: apiMessage.Role,
-			},
-			Content: chat.Content{
-				ContentType: "text",
-				Parts:       []string{apiMessage.Content},
-			},
-		})
-	}
+	messages := buildChatMessages(apiReq)
 	parentMessageId := strings.TrimSpace(apiReq.ParentMessageId)
 	if parentMessageId == "" {
 		parentMessageId = uuid.New().String()
@@ -58,6 +47,68 @@ func BuildChatRequest(apiReq *ApiReq) *chat.Request {
 			PixelRatio:      2,
 			ScreenHeight:    1440,
 			ScreenWidth:     2560,
+		},
+	}
+}
+
+func buildChatMessages(apiReq *ApiReq) []chat.Message {
+	if len(apiReq.Messages) == 0 {
+		return nil
+	}
+	if isStatefulConversation(apiReq) {
+		return []chat.Message{newChatMessage("user", latestUserContent(apiReq.Messages))}
+	}
+	if len(apiReq.Messages) == 1 {
+		msg := apiReq.Messages[0]
+		return []chat.Message{newChatMessage(msg.Role, msg.Content)}
+	}
+	return []chat.Message{newChatMessage("user", renderOpenAIHistory(apiReq.Messages))}
+}
+
+func isStatefulConversation(apiReq *ApiReq) bool {
+	return strings.TrimSpace(apiReq.ConversationId) != "" || strings.TrimSpace(apiReq.ParentMessageId) != ""
+}
+
+func latestUserContent(messages []ApiMessage) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(messages[i].Role), "user") {
+			return messages[i].Content
+		}
+	}
+	return messages[len(messages)-1].Content
+}
+
+func renderOpenAIHistory(messages []ApiMessage) string {
+	var b strings.Builder
+	b.WriteString("You are continuing an OpenAI-compatible chat conversation. Use the prior turns only as context. Answer only the final user message; do not repeat or answer earlier turns again.\n\n")
+	b.WriteString("[conversation]\n")
+	for _, msg := range messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			role = "user"
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("%s: %s\n", role, content))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func newChatMessage(role string, content string) chat.Message {
+	role = strings.TrimSpace(role)
+	if role == "" {
+		role = "user"
+	}
+	return chat.Message{
+		Id: uuid.New().String(),
+		Author: chat.Author{
+			Role: role,
+		},
+		Content: chat.Content{
+			ContentType: "text",
+			Parts:       []string{content},
 		},
 	}
 }
