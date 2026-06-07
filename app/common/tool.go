@@ -3,6 +3,7 @@ package common
 import (
 	"chat2api/app/constant"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -12,9 +13,12 @@ var (
 	clientProfile   = getRandomClientProfile()
 	ua              = FakeUaAgent()
 	updateThreshold = constant.ReTry
+	clientStateLock sync.Mutex
 )
 
 func SubUpdateThreshold() {
+	clientStateLock.Lock()
+	defer clientStateLock.Unlock()
 	updateThreshold--
 }
 func getRandomClientProfile() profiles.ClientProfile {
@@ -32,6 +36,8 @@ func getRandomClientProfile() profiles.ClientProfile {
 }
 
 func GetClientProfile() profiles.ClientProfile {
+	clientStateLock.Lock()
+	defer clientStateLock.Unlock()
 	if updateThreshold < 0 {
 		clientProfile = getRandomClientProfile()
 		updateThreshold = constant.ReTry
@@ -40,6 +46,8 @@ func GetClientProfile() profiles.ClientProfile {
 }
 
 func GetUa() string {
+	clientStateLock.Lock()
+	defer clientStateLock.Unlock()
 	if updateThreshold < 0 {
 		ua = FakeUaAgent()
 		updateThreshold = constant.ReTry

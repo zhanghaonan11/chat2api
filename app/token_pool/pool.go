@@ -11,7 +11,7 @@ var (
 )
 
 type AccessTokenPool struct {
-	mu           sync.Mutex
+	lock         sync.RWMutex
 	AccessTokens []*AccessToken
 	index        int
 }
@@ -38,41 +38,54 @@ func GetAccessTokenPool() *AccessTokenPool {
 }
 
 func (a *AccessTokenPool) AddAccessToken(accessToken *AccessToken) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.AccessTokens = append(a.AccessTokens, accessToken)
+	if accessToken == nil {
+		return
+	}
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	tokenCopy := *accessToken
+	a.AccessTokens = append(a.AccessTokens, &tokenCopy)
 }
 
 func (a *AccessTokenPool) Reset() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.lock.Lock()
+	defer a.lock.Unlock()
 	a.AccessTokens = make([]*AccessToken, 0)
 	a.index = -1
 }
 
 func (a *AccessTokenPool) AppendAccessTokens(accessTokens []*AccessToken) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.AccessTokens = append(a.AccessTokens, accessTokens...)
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	a.AccessTokens = append(a.AccessTokens, cloneAccessTokens(accessTokens)...)
+}
+
+func (a *AccessTokenPool) ReplaceAccessTokens(accessTokens []*AccessToken) {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	a.AccessTokens = cloneAccessTokens(accessTokens)
+	a.index = -1
 }
 
 func (a *AccessTokenPool) Size() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.lock.RLock()
+	defer a.lock.RUnlock()
 	return len(a.AccessTokens)
 }
 
 func (a *AccessTokenPool) IsEmpty() bool {
-	return a.Size() == 0
+	a.lock.RLock()
+	defer a.lock.RUnlock()
+	return len(a.AccessTokens) == 0
 }
 
 func (a *AccessTokenPool) CanUseSize() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.lock.RLock()
+	defer a.lock.RUnlock()
+	var count int
 	now := common.GetTimestampSecond(0)
-	count := 0
 	for _, v := range a.AccessTokens {
-		if v.CanUseAt <= now && v.ExpiresAt > now {
+		if v != nil && v.CanUseAt <= now && v.ExpiresAt > now {
 			count++
 		}
 	}
@@ -88,34 +101,45 @@ func (a *AccessTokenPool) GetToken() string {
 }
 
 func (a *AccessTokenPool) GetAccessToken() *AccessToken {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
+	a.lock.Lock()
+	defer a.lock.Unlock()
 	if len(a.AccessTokens) == 0 {
 		return nil
 	}
-
 	now := common.GetTimestampSecond(0)
-	total := len(a.AccessTokens)
-
-	for i := 0; i < total; i++ {
-		a.index = (a.index + 1) % total
-		token := a.AccessTokens[a.index]
-		if token.CanUseAt <= now && token.ExpiresAt > now {
-			return token
+	for range a.AccessTokens {
+		a.index = (a.index + 1) % len(a.AccessTokens)
+		accessToken := a.AccessTokens[a.index]
+		if accessToken == nil {
+			continue
+		}
+		if accessToken.CanUseAt <= now && accessToken.ExpiresAt > now {
+			tokenCopy := *accessToken
+			return &tokenCopy
 		}
 	}
-
 	return nil
 }
 
 func (a *AccessTokenPool) SetCanUseAt(token string, canUseAt int64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.lock.Lock()
+	defer a.lock.Unlock()
 	for _, v := range a.AccessTokens {
-		if v.Token == token {
+		if v != nil && v.Token == token {
 			v.CanUseAt = canUseAt
 			break
 		}
 	}
+}
+
+func cloneAccessTokens(accessTokens []*AccessToken) []*AccessToken {
+	clone := make([]*AccessToken, 0, len(accessTokens))
+	for _, accessToken := range accessTokens {
+		if accessToken == nil {
+			continue
+		}
+		tokenCopy := *accessToken
+		clone = append(clone, &tokenCopy)
+	}
+	return clone
 }

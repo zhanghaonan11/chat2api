@@ -27,18 +27,6 @@ type Loader struct {
 	ctx         context.Context
 }
 
-func (l *Loader) init() error {
-	sha256hex, err := l.configSHA256()
-	if err != nil {
-		return err
-	}
-	l.sha256 = sha256hex
-	ctx, cancel := context.WithCancel(context.TODO())
-	l.watchCancel = cancel
-	go l.watch(ctx)
-	return nil
-}
-
 func (l *Loader) executeLoader() error {
 	l.lock.RLock()
 	defer l.lock.RUnlock()
@@ -89,16 +77,14 @@ func (l *Loader) configSHA256() (string, error) {
 }
 
 func (l *Loader) Close() {
-	l.watchCancel()
+	if l.watchCancel != nil {
+		l.watchCancel()
+	}
 }
 
 func NewLoader(ctx context.Context, path string, loadFn func([]byte) error) (*Loader, error) {
 	logx.WithContext(ctx).Infof("load config %v", path)
 	l := &Loader{path: path, loadFn: loadFn, ctx: ctx}
-	if err := l.init(); err != nil {
-		return nil, err
-	}
-
 	file, err := os.ReadFile(l.path)
 	if err != nil {
 		return nil, err
@@ -106,28 +92,16 @@ func NewLoader(ctx context.Context, path string, loadFn func([]byte) error) (*Lo
 	if err = l.loadFn(file); err != nil {
 		return nil, err
 	}
-	if sha256hex, err := l.configSHA256(); err == nil {
-		l.sha256 = sha256hex
+	sha256hex, err := l.configSHA256()
+	if err != nil {
+		return nil, err
 	}
+	l.sha256 = sha256hex
+	ctx, cancel := context.WithCancel(context.TODO())
+	l.watchCancel = cancel
+	go l.watch(ctx)
 
 	return l, nil
-}
-
-var (
-	appMu sync.RWMutex
-	App   = defaultApp()
-)
-
-func GetApp() app {
-	appMu.RLock()
-	defer appMu.RUnlock()
-	return App
-}
-
-func setApp(next app) {
-	appMu.Lock()
-	defer appMu.Unlock()
-	App = next
 }
 
 func defaultApp() app {
@@ -177,9 +151,9 @@ func ensureConfigFile(ctx context.Context, path string, curr env.Env) error {
 	return nil
 }
 
-func ensureAuthTokens(path string, cfg *app) error {
-	if len(nonEmptyAuthTokens(cfg.Auth.AccessTokens)) > 0 {
-		cfg.Auth.AccessTokens = nonEmptyAuthTokens(cfg.Auth.AccessTokens)
+func ensureAuthTokens(path string, cfg *app, persist bool) error {
+	cfg.Auth.AccessTokens = nonEmptyAuthTokens(cfg.Auth.AccessTokens)
+	if len(cfg.Auth.AccessTokens) > 0 {
 		return nil
 	}
 	token, err := newAuthToken()
@@ -187,28 +161,28 @@ func ensureAuthTokens(path string, cfg *app) error {
 		return err
 	}
 	cfg.Auth.AccessTokens = []string{token}
+	if !persist {
+		return nil
+	}
 	return saveAuthTokens(path, cfg.Auth.AccessTokens)
 }
 
-func normalizeConfig(cfg *app) {
+func normalizeConfig(cfg *app) []*token_pool.AccessToken {
 	cfg.Auth.AccessTokens = nonEmptyAuthTokens(cfg.Auth.AccessTokens)
-	for i, token := range cfg.Auth.AccessTokens {
-		cfg.Auth.AccessTokens[i] = normalizeAuthToken(token)
-	}
-	pool := token_pool.GetAccessTokenPool()
-	pool.Reset()
+	accessTokens := make([]*token_pool.AccessToken, 0, len(cfg.ChatGPTs))
 	for _, account := range cfg.ChatGPTs {
 		token := strings.TrimSpace(account.AccessToken)
 		token = strings.TrimPrefix(token, "Bearer ")
 		if token == "" {
 			continue
 		}
-		pool.AddAccessToken(&token_pool.AccessToken{
+		accessTokens = append(accessTokens, &token_pool.AccessToken{
 			Token:     "Bearer " + token,
 			ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
 			Proxy:     strings.TrimSpace(account.Proxy),
 		})
 	}
+	return accessTokens
 }
 
 func maskedAuthTokens(tokens []string) []string {
@@ -335,6 +309,39 @@ func setMappingChild(root *yaml.Node, key string, value *yaml.Node) {
 	)
 }
 
+func loadConfig(ctx context.Context, path string, data []byte, persistAuth bool) error {
+	cfg := defaultApp()
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return err
+	}
+	if err := ensureAuthTokens(path, &cfg, persistAuth); err != nil {
+		return err
+	}
+	accessTokens := normalizeConfig(&cfg)
+	if err := logx.Configure(cfg.LogLevel, cfg.LogPath, cfg.LogFile); err != nil {
+		return err
+	}
+	setApp(cfg)
+	token_pool.GetAccessTokenPool().ReplaceAccessTokens(accessTokens)
+	logx.WithContext(ctx).Infof("current auth tokens: count=%d masked=%s", len(cfg.Auth.AccessTokens), strings.Join(maskedAuthTokens(cfg.Auth.AccessTokens), ", "))
+	return nil
+}
+
+func loadFallbackConfig(ctx context.Context) error {
+	cfg := defaultGeneratedApp(env.Curr)
+	if err := ensureAuthTokens("", &cfg, false); err != nil {
+		return err
+	}
+	accessTokens := normalizeConfig(&cfg)
+	if err := logx.Configure(cfg.LogLevel, cfg.LogPath, cfg.LogFile); err != nil {
+		return err
+	}
+	setApp(cfg)
+	token_pool.GetAccessTokenPool().ReplaceAccessTokens(accessTokens)
+	logx.WithContext(ctx).Warnf("config file is unavailable, generated runtime-only auth: %s", strings.Join(maskedAuthTokens(cfg.Auth.AccessTokens), ", "))
+	return nil
+}
+
 func Init(ctx context.Context) func(context.Context) {
 	wd, _ := os.Getwd()
 	path := filepath.Join(wd, "conf", fmt.Sprintf("app.%s.yaml", env.Curr))
@@ -342,23 +349,13 @@ func Init(ctx context.Context) func(context.Context) {
 		logx.WithContext(ctx).Fatalf("generate config failed: %+v", err)
 	}
 	loader, err := NewLoader(ctx, path, func(data []byte) error {
-		next := defaultApp()
-		if err := yaml.Unmarshal(data, &next); err != nil {
-			return err
-		}
-		if err := ensureAuthTokens(path, &next); err != nil {
-			return err
-		}
-		normalizeConfig(&next)
-		if err := logx.Configure(next.LogLevel, next.LogPath, next.LogFile); err != nil {
-			return err
-		}
-		setApp(next)
-		logx.WithContext(ctx).Infof("current auth tokens: count=%d masked=%s", len(next.Auth.AccessTokens), strings.Join(maskedAuthTokens(next.Auth.AccessTokens), ", "))
-		return nil
+		return loadConfig(ctx, path, data, true)
 	})
 	if err != nil {
-		logx.WithContext(ctx).Fatalf("load config failed: %+v", err)
+		logx.WithContext(ctx).Errorf("load config failed, use default config: %+v", err)
+		if fallbackErr := loadFallbackConfig(ctx); fallbackErr != nil {
+			logx.WithContext(ctx).Fatalf("load fallback config failed: %+v", fallbackErr)
+		}
 	}
 
 	return func(context.Context) {
@@ -387,11 +384,12 @@ func InitServerless(ctx context.Context) func(context.Context) {
 	}
 	applyEnvOverrides(&next)
 	next.Auth.AccessTokens = nonEmptyAuthTokens(next.Auth.AccessTokens)
-	normalizeConfig(&next)
+	accessTokens := normalizeConfig(&next)
 	if err := logx.Configure(next.LogLevel, next.LogPath, ""); err != nil {
 		logx.WithContext(ctx).Fatalf("configure log failed: %+v", err)
 	}
 	setApp(next)
+	token_pool.GetAccessTokenPool().ReplaceAccessTokens(accessTokens)
 	logx.WithContext(ctx).Infof("current auth tokens: count=%d masked=%s", len(next.Auth.AccessTokens), strings.Join(maskedAuthTokens(next.Auth.AccessTokens), ", "))
 	return func(context.Context) {
 		logx.CloseOutput()

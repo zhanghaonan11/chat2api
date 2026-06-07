@@ -1,5 +1,7 @@
 package conf
 
+import "sync"
+
 type app struct {
 	LogLevel       string    `yaml:"log_level"`
 	LogPath        string    `yaml:"log_path"`
@@ -36,4 +38,37 @@ type chatgpt struct {
 	Type         string `yaml:"type"`
 	Expired      string `yaml:"expired"`
 	Proxy        string `yaml:"proxy"`
+}
+
+var appState = struct {
+	sync.RWMutex
+	value app
+}{
+	value: defaultApp(),
+}
+
+var App = defaultApp()
+
+func GetApp() app {
+	appState.RLock()
+	defer appState.RUnlock()
+	return cloneApp(appState.value)
+}
+
+func setApp(value app) {
+	appState.Lock()
+	defer appState.Unlock()
+	appState.value = cloneApp(value)
+	App = cloneApp(value)
+}
+
+func GetAuthAccessTokens() []string {
+	cfg := GetApp()
+	return append([]string(nil), cfg.Auth.AccessTokens...)
+}
+
+func cloneApp(value app) app {
+	value.Auth.AccessTokens = append([]string(nil), value.Auth.AccessTokens...)
+	value.ChatGPTs = append([]chatgpt(nil), value.ChatGPTs...)
+	return value
 }

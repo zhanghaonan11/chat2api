@@ -76,8 +76,8 @@ func New(token string, retry int) (*Client, error) {
 }
 
 func newClient(token string, accountProxy string) (*Client, error) {
-	appConf := conf.GetApp()
-	baseURL := strings.TrimRight(appConf.ChatGPTBaseUrl, "/")
+	cfg := conf.GetApp()
+	baseURL := strings.TrimRight(cfg.ChatGPTBaseUrl, "/")
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com"
 	}
@@ -98,7 +98,7 @@ func newClient(token string, accountProxy string) (*Client, error) {
 	}
 	proxy := strings.TrimSpace(accountProxy)
 	if proxy == "" {
-		proxy = strings.TrimSpace(appConf.Proxy)
+		proxy = strings.TrimSpace(cfg.Proxy)
 	}
 	if proxy != "" {
 		if err := c.HTTP.SetProxy(proxy); err != nil {
